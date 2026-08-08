@@ -38,7 +38,7 @@ from numbers import Integral
 
 import numpy as np
 
-__all__ = ["MeasureResult", "optimal_measure", "sensitivity"]
+__all__ = ["BatchDesign", "ExactDesign", "MeasureResult", "apportion", "identification_front", "optimal_measure", "sensitivity"]
 
 _FLOOR = 1e-12
 
@@ -180,3 +180,190 @@ def optimal_measure(matrices, *, utility=None, blend=0.0, iterations=100_000, to
   final = float(np.max(_sensitivity(stack, cleaned, vector, float(blend))))
   return MeasureResult(weights=cleaned, support=np.flatnonzero(keep), value=_value(stack, cleaned, utility, blend),
                        gap=final, iterations=step)
+
+
+@dataclass(frozen=True, slots=True)
+class ExactDesign:
+  """An integer allocation of `runs` to candidates, and what it costs against the measure."""
+
+  counts: np.ndarray
+  support: np.ndarray
+  efficiency: float
+  runs: int
+
+  @property
+  def table(self):
+    """`(candidate index, run count)` for the candidates that get runs, most runs first."""
+    order = np.argsort(-self.counts[self.support])
+    return [(int(self.support[i]), int(self.counts[self.support[i]])) for i in order]
+
+
+def apportion(weights, runs, matrices=None, *, utility=None, blend=0.0):
+  """Turn a design measure into a whole number of runs per candidate.
+
+  `optimal_measure` returns weights, and an experiment runs integers. With three support
+  points at 0.45/0.31/0.24 and twelve bubbles, somebody has to choose 5/4/3 or 6/4/2, and the
+  equivalence-theorem certificate says nothing about which -- it certifies optimality over
+  MEASURES, and an exact design is not one.
+
+  The method is the efficient rounding of Pukelsheim and Rieder (1992): give every supported
+  candidate one run, hand out the rest by largest remainder, and take the best over the
+  admissible starting multipliers. It is the apportionment rule that maximises the smallest
+  ratio `n_i / (runs * w_i)`, which is what keeps a support point from being rounded away.
+
+  This is a heuristic and it is honest about that. The literature is explicit that rounding
+  works well for large `runs` and carries no guarantee for small ones, which is exactly the
+  regime IMR reaches. So pass `matrices` and the efficiency is MEASURED --
+  `(det M(exact) / det M(xi))^(1/p)`, the D-efficiency of the integer design against the
+  measure it came from -- rather than assumed. For a handful of runs, read that number before
+  believing the design; an exact-design search is the alternative when it is poor.
+
+  That efficiency is always the D-efficiency of the INFORMATION, even when `utility` and
+  `blend` were used to build the measure. A ratio of compound criterion values is not an
+  efficiency -- `log det` and a utility in nats have different units and either sign, so the
+  ratio can exceed one for a design that is worse. `identification_front` reports the utility
+  achieved separately, in nats, because the two halves do not share a scale.
+  """
+  share = np.asarray(weights, dtype=float)
+  if share.ndim != 1: raise ValueError("weights must be one-dimensional")
+  if not np.all(np.isfinite(share)) or np.any(share < 0.0): raise ValueError("weights must be finite and non-negative")
+  total = share.sum()
+  if total <= 0.0: raise ValueError("weights must not be all zero")
+  share = share / total
+  if not isinstance(runs, Integral) or int(runs) < 1: raise ValueError("runs must be a positive integer")
+  runs = int(runs)
+  support = np.flatnonzero(share > _FLOOR)
+  if runs < support.size:
+    raise ValueError(f"{runs} runs cannot cover {support.size} support points; "
+                     "drop candidates or raise the budget")
+
+  best = None
+  # Pukelsheim-Rieder sweeps the multiplier: each choice gives a different integer design and
+  # the rule is to keep the one whose smallest n_i/(runs w_i) is largest.
+  for multiplier in range(support.size, 2 * runs + 1):
+    counts = np.zeros(share.size, dtype=int)
+    raw = multiplier * share[support]
+    counts[support] = np.maximum(np.ceil(raw).astype(int), 1)
+    excess = int(counts.sum()) - runs
+    while excess != 0:
+      if excess > 0:
+        movable = support[counts[support] > 1]
+        if movable.size == 0: break
+        counts[movable[np.argmax(counts[movable] / (runs * share[movable]))]] -= 1
+        excess -= 1
+      else:
+        counts[support[np.argmin(counts[support] / (runs * share[support]))]] += 1
+        excess += 1
+    if int(counts.sum()) != runs: continue
+    score = float(np.min(counts[support] / (runs * share[support])))
+    if best is None or score > best[0]: best = (score, counts)
+  if best is None: raise ValueError(f"no admissible allocation of {runs} runs was found")
+  counts = best[1]
+
+  efficiency = float("nan")
+  if matrices is not None:
+    stack = _checked(matrices)
+    if stack.shape[0] != share.size: raise ValueError("matrices and weights disagree in length")
+    # ALWAYS the D-efficiency of the information, never the compound criterion. A ratio of
+    # compound values is not an efficiency: `log det` and a utility in nats have different
+    # units and either sign, so the ratio can exceed one for a design that is worse -- it did,
+    # reporting 1.017 for a rounded compound design. `log det` differences exponentiate to a
+    # determinant ratio, and the p-th root makes it per parameter, which is a real efficiency.
+    # This measures the ESTIMATION half only; `identification_front` reports the other half in
+    # nats beside it, because the two do not share a scale.
+    exact = _value(stack, counts / runs, None, 0.0)
+    ideal = _value(stack, share, None, 0.0)
+    dimension = stack.shape[1]
+    if np.isfinite(exact) and np.isfinite(ideal):
+      efficiency = float(np.exp((exact - ideal) / dimension))
+  return ExactDesign(counts=counts, support=support, efficiency=efficiency, runs=runs)
+
+
+@dataclass(frozen=True, slots=True)
+class BatchDesign:
+  """One integer batch, scored on both of the things a batch is for."""
+
+  blend: float
+  counts: np.ndarray
+  support: np.ndarray
+  runs: int
+  log_det: float
+  discrimination: float
+  efficiency: float
+  gap: float
+  certified: bool
+
+  @property
+  def settings(self) -> int:
+    """Distinct settings the batch visits. One is a warning, not an achievement."""
+    return int(np.count_nonzero(self.counts))
+
+  @property
+  def table(self):
+    order = np.argsort(-self.counts)
+    return [(int(i), int(self.counts[i])) for i in order if self.counts[i] > 0]
+
+
+def identification_front(matrices, utility, runs, *, blends=None, iterations=100_000,
+                         tolerance=1e-9):
+  """Integer batches that trade parameter precision against telling the models apart.
+
+  A batch is what an experimentalist actually runs, and it has to serve two purposes that
+  pull in different directions: pinning the material, and deciding which model produced the
+  data. `optimal_measure` already accepts both -- `log det M(xi)` for the first and a
+  per-candidate utility for the second -- and their blend is concave for every weighting, so
+  the equivalence-theorem certificate holds all along the front. This walks that front and
+  hands back run counts rather than weights.
+
+  `utility[i]` is the expected log Bayes factor from ONE run at candidate `i`, in nats. Log
+  evidence is additive over independent experiments, so the batch total is `counts . utility`
+  and it is reported directly: the question a collaborator asks is whether `runs` experiments
+  will settle the model question, and that is a number of nats, not a rate.
+
+  WHAT THE ENDS OF THE FRONT MEAN. At `blend = 0` this is D-optimality and ignores the model
+  question entirely. At `blend = 1` the criterion is linear in the measure, so its optimum is
+  a single candidate repeated `runs` times -- the best discriminating setting, run over and
+  over. That is usually a bad experiment for a reason no criterion here can see: a batch on
+  one setting has no replication across settings, so nothing in it can detect that BOTH models
+  are wrong. `BatchDesign.settings` is reported so that collapse is visible rather than
+  implied, and `pyimr.noise.lack_of_fit` is what those extra settings would have bought.
+
+  Both scores are computed on the INTEGER batch, not on the measure it came from, because
+  rounding is where small budgets lose their efficiency and the point of this is what actually
+  gets run.
+  """
+  stack = _checked(matrices)
+  vector = np.asarray(utility, dtype=float)
+  if vector.ndim != 1 or vector.size != stack.shape[0]:
+    raise ValueError(f"utility must be one value per candidate; got {vector.shape} for {stack.shape[0]}")
+  if not np.all(np.isfinite(vector)): raise ValueError("utility must be finite")
+  if not isinstance(runs, Integral) or int(runs) < 1: raise ValueError("runs must be a positive integer")
+  weights = (0.0, 0.25, 0.5, 0.75, 1.0) if blends is None else tuple(float(b) for b in blends)
+  if any(not 0.0 <= b <= 1.0 for b in weights): raise ValueError("blends must lie in [0, 1]")
+
+  def summed_log_det(counts):
+    sign, value = np.linalg.slogdet(np.tensordot(counts.astype(float), stack, axes=(0, 0)))
+    return float(value) if sign > 0 else float("-inf")
+
+  # The reference for `efficiency` is the best PARAMETER precision `runs` runs can buy, not
+  # the compound measure each batch came from. Against the latter the number exceeds one
+  # whenever rounding happens to move back toward D-optimality -- it read 1.114 -- which is
+  # arithmetically fine and useless to read. Against a fixed D-optimal batch of the same size
+  # it answers the question actually being asked: what does chasing the model question cost me
+  # in parameter precision?
+  best = optimal_measure(stack, iterations=iterations, tolerance=tolerance)
+  reference = summed_log_det(apportion(best.weights, int(runs), stack).counts)
+
+  front = []
+  for blend in weights:
+    measure = optimal_measure(stack, utility=vector, blend=blend, iterations=iterations,
+                              tolerance=tolerance)
+    counts = apportion(measure.weights, int(runs), stack, utility=vector, blend=blend).counts
+    value = summed_log_det(counts)
+    efficiency = (0.0 if not np.isfinite(value)
+                  else float(np.exp((value - reference) / stack.shape[1])))
+    front.append(BatchDesign(
+      blend=float(blend), counts=counts, support=np.flatnonzero(counts), runs=int(runs),
+      log_det=value, discrimination=float(counts @ vector), efficiency=efficiency,
+      gap=measure.gap, certified=bool(measure.certified)))
+  return front
